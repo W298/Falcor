@@ -7,11 +7,6 @@ const std::string kColorOut = "output";
 const std::string kShaderFilename = "RenderPasses/MSAA/MSAA.3d.slang";
 } // namespace
 
-extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)
-{
-    registry.registerClass<RenderPass, MSAA>();
-}
-
 MSAA::MSAA(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
 {
     // Init graphics state.

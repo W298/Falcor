@@ -10,27 +10,34 @@ MultiSampledGBuffer::MultiSampledGBuffer(ref<Device> pDevice, const Properties& 
     mpState = GraphicsState::create(mpDevice);
     mpFbo = Fbo::create(mpDevice);
 
-    mFrameDim = uint2(0);
-    mIsResourceDirty = true;
-
-    mSampleCount = 4u;
+    mSampleCount = 8u;
+    if (props.has("sampleCount"))
+        mSampleCount = props["sampleCount"];
 }
 
 RenderPassReflection MultiSampledGBuffer::reflect(const CompileData& compileData)
 {
     RenderPassReflection reflector;
+    const uint2 sz = RenderPassHelpers::calculateIOSize(RenderPassHelpers::IOSize::Default, uint2(0), compileData.defaultTexDims);
+
+    reflector.addInternal("msComplex", "multi-sample complex")
+        .format(ResourceFormat::R16Float)
+        .bindFlags(ResourceBindFlags::RenderTarget)
+        .texture2D(sz.x, sz.y, mSampleCount);
+    reflector.addInternal("msPackedHitInfo", "multi-sample packedHitInfo")
+        .format(ResourceFormat::RGBA32Uint)
+        .bindFlags(ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource)
+        .texture2D(sz.x, sz.y, mSampleCount);
+    reflector.addInternal("msDepth", "multi-sample depth")
+        .format(ResourceFormat::D32Float)
+        .bindFlags(ResourceBindFlags::DepthStencil)
+        .texture2D(sz.x, sz.y, mSampleCount);
 
     reflector.addOutput("complex", "complex pixel mask").format(ResourceFormat::R16Float);
     reflector.addOutput("packedHitInfo", "packed hit info")
         .format(ResourceFormat::RGBA32Uint)
         .bindFlags(ResourceBindFlags::RenderTarget)
-        .texture2D(1920, 1080, mSampleCount);
-
-    if (math::any(mFrameDim != compileData.defaultTexDims))
-    {
-        mIsResourceDirty = true;
-        mFrameDim = compileData.defaultTexDims;
-    }
+        .texture2D(sz.x, sz.y, mSampleCount);
 
     return reflector;
 }
@@ -40,12 +47,9 @@ void MultiSampledGBuffer::execute(RenderContext* pRenderContext, const RenderDat
     const auto& pComplex = renderData.getTexture("complex");
     const auto& pPackedHitInfo = renderData.getTexture("packedHitInfo");
 
-    if (mIsResourceDirty)
-    {
-        createFrameDimDependentResources();
-        mpFbo->attachColorTarget(pPackedHitInfo, 1);
-        mIsResourceDirty = false;
-    }
+    mpFbo->attachColorTarget(renderData.getTexture("msComplex"), 0);
+    mpFbo->attachColorTarget(renderData.getTexture("msPackedHitInfo"), 1);
+    mpFbo->attachDepthStencilTarget(renderData.getTexture("msDepth"));
 
     pRenderContext->clearFbo(mpFbo.get(), float4(0), 1.f, 0, FboAttachmentType::All);
     mpState->setFbo(mpFbo);
@@ -54,6 +58,12 @@ void MultiSampledGBuffer::execute(RenderContext* pRenderContext, const RenderDat
         mpScene->rasterize(pRenderContext, mpState.get(), mpVars.get());
 
     pRenderContext->resolveResource(mpFbo->getColorTexture(0), pComplex);
+    pRenderContext->blit(mpFbo->getColorTexture(1)->getSRV(), pPackedHitInfo->getRTV());
+}
+
+void MultiSampledGBuffer::renderUI(Gui::Widgets& widget)
+{
+    widget.text("Sample Count: " + std::to_string(mSampleCount));
 }
 
 void MultiSampledGBuffer::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
@@ -68,19 +78,10 @@ void MultiSampledGBuffer::setScene(RenderContext* pRenderContext, const ref<Scen
         desc.addTypeConformances(mpScene->getTypeConformances());
 
         mpProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
+        mpProgram->addDefine("SAMPLE_COUNT", std::to_string(mSampleCount));
+
         mpState->setProgram(mpProgram);
 
         mpVars = ProgramVars::create(mpDevice, mpProgram.get());
     }
-}
-
-void MultiSampledGBuffer::createFrameDimDependentResources()
-{
-    mpFbo->attachColorTarget(
-        mpDevice->createTexture2DMS(mFrameDim.x, mFrameDim.y, ResourceFormat::R16Float, mSampleCount, 1, ResourceBindFlags::RenderTarget), 0
-    );
-
-    mpFbo->attachDepthStencilTarget(
-        mpDevice->createTexture2DMS(mFrameDim.x, mFrameDim.y, ResourceFormat::D32Float, mSampleCount, 1, ResourceBindFlags::DepthStencil)
-    );
 }
