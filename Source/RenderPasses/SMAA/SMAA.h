@@ -21,14 +21,21 @@ public:
     virtual void execute(RenderContext* pRenderContext, const RenderData& renderData) override;
 
 private:
+    void loadImage();
     void recompile();
-    void createEdgeDetectionPass();
+    void createPasses();
 
     ref<FullScreenPass>     mpEdgeDetectionPass;
+    ref<FullScreenPass>     mpBlendingWeightCalcPass;
+    ref<FullScreenPass>     mpNeighborhoodBlendingPass;
+
     ref<Fbo>                mpFbo;
 
     ref<Sampler>            mpLinearSampler;
     ref<Sampler>            mpPointSampler;
+
+    ref<Texture>            mpAreaTexture;
+    ref<Texture>            mpSearchTexture;
 
     uint2                   mFrameDim;
     uint                    mFrameIndex;

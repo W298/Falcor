@@ -1,5 +1,6 @@
 #include "SMAA.h"
 #include "RenderGraph/RenderPassHelpers.h"
+#include "Core/AssetResolver.h"
 
 extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)
 {
@@ -24,6 +25,8 @@ SMAA::SMAA(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice)
         mpPointSampler = mpDevice->createSampler(desc);
     }
 
+    loadImage();
+
     mFrameDim = uint2(0);
     mFrameIndex = 0u;
 }
@@ -34,9 +37,15 @@ RenderPassReflection SMAA::reflect(const CompileData& compileData)
     const uint2 sz = RenderPassHelpers::calculateIOSize(RenderPassHelpers::IOSize::Default, uint2(0), compileData.defaultTexDims);
 
     reflection.addInput("color", "color texture").format(ResourceFormat::RGBA32Float).bindFlags(ResourceBindFlags::ShaderResource);
-    reflection.addInput("depth", "depth texture").format(ResourceFormat::D32Float).bindFlags(ResourceBindFlags::ShaderResource);
 
-    reflection.addOutput("edge", "edge texture").format(ResourceFormat::RG32Float).bindFlags(ResourceBindFlags::RenderTarget);
+    reflection.addOutput("edge", "edge texture")
+        .format(ResourceFormat::RG32Float)
+        .bindFlags(ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource);
+    reflection.addOutput("blend", "blending weight texture")
+        .format(ResourceFormat::RGBA32Float)
+        .bindFlags(ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource);
+
+    reflection.addOutput("output", "output texture").format(ResourceFormat::RGBA32Float).bindFlags(ResourceBindFlags::RenderTarget);
 
     if (math::any(mFrameDim != compileData.defaultTexDims))
     {
@@ -50,9 +59,11 @@ RenderPassReflection SMAA::reflect(const CompileData& compileData)
 void SMAA::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
     const auto& pColor = renderData.getTexture("color");
-    const auto& pDepth = renderData.getTexture("depth");
 
     const auto& pEdge = renderData.getTexture("edge");
+    const auto& pBlend = renderData.getTexture("blend");
+
+    const auto& pOutput = renderData.getTexture("output");
 
     if (mpEdgeDetectionPass)
     {
@@ -61,7 +72,6 @@ void SMAA::execute(RenderContext* pRenderContext, const RenderData& renderData)
         auto var = mpEdgeDetectionPass->getRootVar();
 
         var["gColor"] = pColor;
-        var["gDepth"] = pDepth;
 
         var["LinearSampler"] = mpLinearSampler;
         var["PointSampler"] = mpPointSampler;
@@ -70,22 +80,112 @@ void SMAA::execute(RenderContext* pRenderContext, const RenderData& renderData)
         mpEdgeDetectionPass->execute(pRenderContext, mpFbo);
     }
 
+    if (mpBlendingWeightCalcPass)
+    {
+        pRenderContext->clearRtv(pBlend->getRTV().get(), float4(0.f));
+
+        auto var = mpBlendingWeightCalcPass->getRootVar();
+
+        var["gArea"] = mpAreaTexture;
+        var["gSearch"] = mpSearchTexture;
+        var["gEdge"] = pEdge;
+
+        mpFbo->attachColorTarget(pBlend, 0);
+        mpBlendingWeightCalcPass->execute(pRenderContext, mpFbo);
+    }
+
+    if (mpNeighborhoodBlendingPass)
+    {
+        pRenderContext->clearRtv(pOutput->getRTV().get(), float4(0.f));
+
+        auto var = mpNeighborhoodBlendingPass->getRootVar();
+
+        var["gColor"] = pColor;
+        var["gBlend"] = pBlend;
+
+        mpFbo->attachColorTarget(pOutput, 0);
+        mpNeighborhoodBlendingPass->execute(pRenderContext, mpFbo);
+    }
+
     mFrameIndex++;
+}
+
+void SMAA::loadImage()
+{
+    {
+        std::filesystem::path resolvedPath =
+            AssetResolver::getDefaultResolver().resolvePath("F:\\Falcor\\Source\\RenderPasses\\SMAA\\Textures\\AreaTexDX10.png");
+        if (std::filesystem::exists(resolvedPath))
+        {
+            mpAreaTexture = Texture::createFromFile(mpDevice, resolvedPath, true, false, ResourceBindFlags::ShaderResource);
+        }
+        else
+        {
+            msgBox("Error", fmt::format("Failed to load image"), MsgBoxType::Ok, MsgBoxIcon::Warning);
+        }
+    }
+
+    {
+        std::filesystem::path resolvedPath =
+            AssetResolver::getDefaultResolver().resolvePath("F:\\Falcor\\Source\\RenderPasses\\SMAA\\Textures\\SearchTex.png");
+        if (std::filesystem::exists(resolvedPath))
+        {
+            mpSearchTexture = Texture::createFromFile(mpDevice, resolvedPath, true, false, ResourceBindFlags::ShaderResource);
+        }
+        else
+        {
+            msgBox("Error", fmt::format("Failed to load image"), MsgBoxType::Ok, MsgBoxIcon::Warning);
+        }
+    }
 }
 
 void SMAA::recompile()
 {
-    createEdgeDetectionPass();
+    createPasses();
     requestRecompile();
 }
 
-void SMAA::createEdgeDetectionPass()
+void SMAA::createPasses()
 {
-    ProgramDesc desc;
-    desc.addShaderLibrary("RenderPasses/SMAA/SMAA.slang").vsEntry("edgeDetectionVS").psEntry("edgeDetectionPS");
+    {
+        ProgramDesc desc;
+        desc.addShaderLibrary("RenderPasses/SMAA/SMAA.slang").vsEntry("edgeDetectionVS").psEntry("edgeDetectionPS");
 
-    DefineList defines;
-    defines.add("SMAA_RT_METRICS", "float4(1.0 / 1920.0, 1.0 / 1080.0, 1920.0, 1080.0)");
+        DefineList defines;
+        defines.add(
+            "SMAA_RT_METRICS",
+            "float4(1.0 / " + std::to_string(mFrameDim.x) + ", 1.0 / " + std::to_string(mFrameDim.y) + ", " + std::to_string(mFrameDim.x) +
+                ", " + std::to_string(mFrameDim.y) + ")"
+        );
 
-    mpEdgeDetectionPass = FullScreenPass::create(mpDevice, desc, defines);
+        mpEdgeDetectionPass = FullScreenPass::create(mpDevice, desc, defines);
+    }
+
+    {
+        ProgramDesc desc;
+        desc.addShaderLibrary("RenderPasses/SMAA/SMAA.slang").vsEntry("blendingWeightCalculationVS").psEntry("blendingWeightCalculationPS");
+
+        DefineList defines;
+        defines.add(
+            "SMAA_RT_METRICS",
+            "float4(1.0 / " + std::to_string(mFrameDim.x) + ", 1.0 / " + std::to_string(mFrameDim.y) + ", " + std::to_string(mFrameDim.x) +
+                ", " + std::to_string(mFrameDim.y) + ")"
+        );
+
+        mpBlendingWeightCalcPass = FullScreenPass::create(mpDevice, desc, defines);
+    }
+
+    {
+        ProgramDesc desc;
+        desc.addShaderLibrary("RenderPasses/SMAA/SMAA.slang").vsEntry("neighborhoodBlendingVS").psEntry("neighborhoodBlendingPS");
+
+        DefineList defines;
+        defines.add(
+            "SMAA_RT_METRICS",
+            "float4(1.0 / " + std::to_string(mFrameDim.x) + ", 1.0 / " + std::to_string(mFrameDim.y) + ", " + std::to_string(mFrameDim.x) +
+                ", " + std::to_string(mFrameDim.y) + ")"
+        );
+
+        mpNeighborhoodBlendingPass = FullScreenPass::create(mpDevice, desc, defines);
+    }
 }
